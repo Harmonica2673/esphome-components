@@ -13,9 +13,56 @@ namespace wmbus {
     this->gdo2 = gdo2;
     pinMode(this->gdo0, INPUT);
     pinMode(this->gdo2, INPUT);
+    pinMode(clk, OUTPUT);
+    pinMode(mosi, OUTPUT);
+    pinMode(cs, OUTPUT);
+    pinMode(miso, INPUT);
+    
+    digitalWrite(cs, HIGH);
+
     ELECHOUSE_cc1101.setSpiPin(clk, miso, mosi, cs);
 
-    ELECHOUSE_cc1101.Init();
+    ESP_LOGD(TAG, "Starting manual CC1101 Reset...");
+    
+    digitalWrite(cs, LOW);
+    delayMicroseconds(10);
+    digitalWrite(cs, HIGH);
+    delayMicroseconds(40);
+    digitalWrite(cs, LOW);
+
+    digitalWrite(cs, HIGH);
+
+    ESP_LOGD(TAG, "Configuring registers...");
+    
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FSCTRL1,  0x06);
+    
+    ELECHOUSE_cc1101.setCCMode(0);
+    ELECHOUSE_cc1101.setMHZ(freq);
+    
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_MDMCFG1,  0x02);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_MDMCFG0,  0xF8);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_CHANNR,   0);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_DEVIATN,  0x47);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FREND1,   0x56);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_MCSM0 ,   0x18);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FOCCFG,   0x16);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_BSCFG,    0x1C);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_AGCCTRL2, 0xC7);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_AGCCTRL1, 0x00);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_AGCCTRL0, 0xB2);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FSCAL3,   0xE9);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FSCAL2,   0x2A);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FSCAL1,   0x00);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FSCAL0,   0x1F);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_FSTEST,   0x59);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_TEST2,    0x81);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_TEST1,    0x35);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_TEST0,    0x09);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_PKTCTRL1, 0x04);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_ADDR,     0x00);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_PKTLEN,   0x00);
+
+    ESP_LOGD(TAG, "CC1101 initialized manually on S3!");
 
     for (uint8_t i = 0; i < TMODE_RF_SETTINGS_LEN; i++) {
       ELECHOUSE_cc1101.SpiWriteReg(TMODE_RF_SETTINGS_BYTES[i << 1],
