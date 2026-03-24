@@ -3,7 +3,9 @@
 #include "esphome/core/log.h"
 
 namespace esphome {
+
 namespace wmbus_radio {
+
 static const char *TAG = "CC1101";
 
 // CC1101 crystal frequency (standard 26 MHz)
@@ -11,7 +13,6 @@ static const char *TAG = "CC1101";
 
 void CC1101::setup() {
   this->common_setup();
-
   ESP_LOGV(TAG, "Setup");
 
   // CC1101 has no hardware reset pin — skip hardware reset, use software reset only
@@ -23,6 +24,7 @@ void CC1101::setup() {
   uint8_t partnum = this->read_status_register(CC1101_PARTNUM);
   uint8_t version = this->read_status_register(CC1101_VERSION);
   ESP_LOGVV(TAG, "part: %02X, version: %02X", partnum, version);
+
   if (partnum != 0x00) {
     ESP_LOGE(TAG, "Invalid part number: %02X (expected 0x00)", partnum);
     return;
@@ -30,18 +32,23 @@ void CC1101::setup() {
 
   // Configure for wM-Bus Mode C/T at 868.95 MHz, 100 kbps, 2-FSK
   // RF settings based on TI Design Note DN022 and wmbusmeters reference
-
   ESP_LOGVV(TAG, "configuring GDO pins");
-  // GDO2: Sync word sent/received (active low, inverted)
-  this->write_register(CC1101_IOCFG2, CC1101_GDO_SYNC_WORD | 0x40);
+  // GDO2: Sync word sent/received (active high)
+  this->write_register(CC1101_IOCFG2, CC1101_GDO_SYNC_WORD);
   // GDO1: High impedance (unused, default)
   this->write_register(CC1101_IOCFG1, CC1101_GDO_HI_Z);
-  // GDO0: RXFIFO threshold reached (IRQ pin), active low (inverted)
-  this->write_register(CC1101_IOCFG0, CC1101_GDO_RXFIFO_THR | 0x40);
+  // FIX: GDO0 = 0x01 — asserts when RX FIFO >= threshold OR end-of-packet reached,
+  //      active HIGH (no 0x40 inversion). The previous value (RXFIFO_THR | 0x40, active
+  //      low, threshold-only) meant short frames whose payload never reached 32 bytes
+  //      never triggered the IRQ at all.
+  this->write_register(CC1101_IOCFG0, 0x01);
 
   ESP_LOGVV(TAG, "configuring FIFO threshold");
-  // FIFO threshold: 7 = RX FIFO >= 32 bytes, TX FIFO <= 31 bytes
-  this->write_register(CC1101_FIFOTHR, 0x07);
+  // FIX: Lower threshold from 0x07 (32 bytes) to 0x00 (4 bytes).
+  //      With the old 32-byte threshold, any frame shorter than 32 bytes of payload
+  //      would never assert GDO0 via the threshold path; only the new EOP path (above)
+  //      saves them. A low threshold also reduces FIFO-overflow risk on longer frames.
+  this->write_register(CC1101_FIFOTHR, 0x00);
 
   ESP_LOGVV(TAG, "configuring sync word");
   // Sync word for wM-Bus: 0x543D (with Manchester encoding: preamble 0x54)
@@ -49,13 +56,17 @@ void CC1101::setup() {
   this->write_register(CC1101_SYNC0, WMBUS_SYNC_WORD_LOW);
 
   ESP_LOGVV(TAG, "configuring packet control");
-  // Packet length: 0xFF for infinite/variable
+  // Max packet length cap when using variable-length mode
   this->write_register(CC1101_PKTLEN, 0xFF);
-  // Packet control 1: No address check, no append status, no CRC autoflush
+  // No address check, no append status, no CRC autoflush
   this->write_register(CC1101_PKTCTRL1, 0x00);
-  // Packet control 0: Variable packet length, no whitening, no CRC
-  this->write_register(CC1101_PKTCTRL0, 0x00);
-
+  // FIX: Variable packet length mode (bits[1:0] = 0b01).
+  //      The original value 0x00 (fixed 255-byte mode) caused the CC1101 state machine
+  //      to wait for exactly 255 bytes before signalling end-of-packet, so MARCSTATE
+  //      never reached IDLE on normal wM-Bus frames and every packet hit the 500ms
+  //      timeout. In variable mode the first byte in the FIFO is treated as the frame
+  //      length, which matches the wM-Bus L-field exactly.
+  this->write_register(CC1101_PKTCTRL0, 0x01);
   // No device address filtering
   this->write_register(CC1101_ADDR, 0x00);
   // Channel number 0
@@ -211,13 +222,12 @@ uint8_t CC1101::get_rx_bytes() {
 }
 
 optional<uint8_t> CC1101::read() {
-  // Check if IRQ pin indicates data available (active low = FIFO threshold reached)
-  if (this->irq_pin_->digital_read() == false) {
+  // FIX: GDO0 is now active HIGH (EOP or threshold), so check for true not false.
+  if (this->irq_pin_->digital_read() == true) {
     uint8_t rx_bytes = this->get_rx_bytes();
     if (rx_bytes > 0) {
       // Read RSSI before reading data byte (RSSI is valid after sync word)
       this->last_rssi_ = (int8_t)this->read_status_register(CC1101_RSSI);
-
       // Read single byte from RX FIFO
       uint8_t data;
       this->read_burst(CC1101_RXFIFO, &data, 1);
@@ -233,21 +243,17 @@ size_t CC1101::get_frame(uint8_t *buffer, size_t length, uint32_t offset) {
   auto byte = this->read();
   if (!byte.has_value())
     return 0;
-
   *buffer = *byte;
   return 1;
 }
 
 void CC1101::restart_rx() {
   ESP_LOGVV(TAG, "Restarting RX");
-
   // Go to IDLE state
   this->strobe(CC1101_SIDLE);
   delay(1);
-
   // Flush RX FIFO
   this->strobe(CC1101_SFRX);
-
   // Enter RX mode
   this->strobe(CC1101_SRX);
   delay(1);
@@ -286,10 +292,28 @@ bool CC1101::read_in_task(uint8_t *buffer, size_t length, uint32_t offset) {
     size_t remaining = length - total;
 
     if (available > 0) {
-      // CC1101 errata: don't empty FIFO completely when more data expected
-      size_t to_read = (remaining > 1 && available > 1)
-                       ? std::min((size_t)(available - 1), remaining)
-                       : std::min((size_t)available, remaining);
+      // FIX: Re-read MARCSTATE here (once per loop iteration) so the errata guard and
+      //      the end-of-packet drain both use the same consistent snapshot, avoiding a
+      //      race where the state changes between two separate reads.
+      uint8_t marcstate = this->read_status_register(CC1101_MARCSTATE) & 0x1F;
+      bool still_receiving = (marcstate == CC1101_MARCSTATE_RX);  // 0x0D per datasheet
+
+      size_t to_read;
+      if (still_receiving && available == 1) {
+        // FIX: Only 1 byte available and radio is still actively receiving.
+        //      Leave it — reading the last byte from an active FIFO can corrupt the
+        //      next byte per CC1101 errata. Wait for more data to arrive.
+        to_read = 0;
+      } else if (still_receiving) {
+        // FIX: Radio still receiving — leave 1-byte guard per errata, read the rest.
+        //      The original condition (remaining > 1 && available > 1) was wrong: it
+        //      left 1 byte un-read even after the radio finished, causing the loop to
+        //      stall on the last byte of any frame.
+        to_read = std::min((size_t)(available - 1), remaining);
+      } else {
+        // Radio finished receiving (IDLE or other terminal state) — safe to drain all.
+        to_read = std::min((size_t)available, remaining);
+      }
 
       if (to_read > 0) {
         if (total == 0 && offset == 0) {
@@ -299,13 +323,15 @@ bool CC1101::read_in_task(uint8_t *buffer, size_t length, uint32_t offset) {
         total += to_read;
         last_progress = millis();
       }
-    }
 
-    // Check end-of-packet via MARCSTATE (IDLE or RX_END = packet done)
-    if (total > 0 && total < length) {
-      uint8_t marcstate = this->read_status_register(CC1101_MARCSTATE) & 0x1F;
-      if (marcstate == CC1101_MARCSTATE_IDLE || marcstate == CC1101_MARCSTATE_RX_END) {
-        // Packet finished, drain remaining FIFO
+      // FIX: Only check for end-of-packet via MARCSTATE_IDLE (0x01).
+      //      The original code also checked CC1101_MARCSTATE_RX_END which is not a
+      //      valid CC1101 state (not defined in the datasheet), so that branch never
+      //      fired. With variable-length packet mode, the chip transitions to IDLE
+      //      cleanly after the last byte, making this check reliable.
+      if (marcstate == CC1101_MARCSTATE_IDLE) {
+        // Packet is complete — drain any bytes that arrived between the RXBYTES read
+        // above and now, then exit.
         uint8_t final_bytes = this->read_status_register(CC1101_RXBYTES) & 0x7F;
         if (final_bytes > 0 && total + final_bytes <= length) {
           this->read_burst(CC1101_RXFIFO, buffer + total, final_bytes);
@@ -328,4 +354,5 @@ bool CC1101::read_in_task(uint8_t *buffer, size_t length, uint32_t offset) {
 }
 
 } // namespace wmbus_radio
+
 } // namespace esphome
