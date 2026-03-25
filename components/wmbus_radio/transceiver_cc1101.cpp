@@ -11,11 +11,14 @@ static const char *TAG = "CC1101";
 // CC1101 crystal frequency (standard 26 MHz)
 #define F_XTAL 26000000
 
+// ── setup() ─────────────────────────────────────────────────────────────────
+// UNCHANGED from original. Every register value is identical.
+// Previous attempts that modified PKTCTRL0, IOCFG0, or FIFOTHR all broke
+// reception and have been reverted.
 void CC1101::setup() {
   this->common_setup();
   ESP_LOGV(TAG, "Setup");
 
-  // CC1101 has no hardware reset pin — skip hardware reset, use software reset only
   ESP_LOGVV(TAG, "software reset (SRES)");
   this->strobe(CC1101_SRES);
   delay(10);
@@ -30,20 +33,16 @@ void CC1101::setup() {
     return;
   }
 
-  // Configure for wM-Bus Mode C/T at 868.95 MHz, 100 kbps, 2-FSK
-  // RF settings based on TI Design Note DN022 and wmbusmeters reference
   ESP_LOGVV(TAG, "configuring GDO pins");
-  // GDO2: Sync word sent/received (active low, inverted) — UNCHANGED
+  // GDO2: Sync word sent/received (active low, inverted)
   this->write_register(CC1101_IOCFG2, CC1101_GDO_SYNC_WORD | 0x40);
-  // GDO1: High impedance (unused, default) — UNCHANGED
+  // GDO1: High impedance (unused)
   this->write_register(CC1101_IOCFG1, CC1101_GDO_HI_Z);
-  // GDO0: RXFIFO threshold reached (IRQ pin), active low (inverted) — UNCHANGED
-  // Short frames were already working with this setting; do not change it.
+  // GDO0: RX FIFO threshold reached, active low (inverted) → falling edge = data ready
   this->write_register(CC1101_IOCFG0, CC1101_GDO_RXFIFO_THR | 0x40);
 
   ESP_LOGVV(TAG, "configuring FIFO threshold");
-  // FIFO threshold: 7 = RX FIFO >= 32 bytes — UNCHANGED
-  // Short frames worked with this; do not change it.
+  // 0x07 = RX FIFO asserts when ≥ 32 bytes present
   this->write_register(CC1101_FIFOTHR, 0x07);
 
   ESP_LOGVV(TAG, "configuring sync word");
@@ -52,24 +51,9 @@ void CC1101::setup() {
 
   ESP_LOGVV(TAG, "configuring packet control");
   this->write_register(CC1101_PKTLEN, 0xFF);
-  // No address check, no append status, no CRC autoflush
   this->write_register(CC1101_PKTCTRL1, 0x00);
-  // *** FIX 1: Infinite packet length mode (0x02) ***
-  //
-  // Original value 0x00 = fixed 255-byte mode. The CC1101 waited for exactly 255
-  // bytes before declaring end-of-packet, so MARCSTATE never reached IDLE on real
-  // wM-Bus frames and read_in_task() timed out every time on long frames.
-  //
-  // Variable length mode (0x01) was tried but is also wrong here: it reads the first
-  // FIFO byte as the frame length. Since Manchester decoding is done in software
-  // (MDMCFG2 has Manchester disabled), the FIFO contains raw Manchester chips, not
-  // decoded bytes — the CC1101 would misread the length and break reception entirely.
-  //
-  // Infinite mode (0x02): the CC1101 never terminates reception via a hardware length
-  // field. The FIFO fills continuously and software manages all frame boundaries using
-  // the decoded L-field. This matches the author's own wMbus-lib reference code which
-  // explicitly sets INFINITE_PACKET_LENGTH for exactly this reason.
-  this->write_register(CC1101_PKTCTRL0, 0x02);
+  // 0x00 = fixed 255-byte packet length mode (original, unchanged)
+  this->write_register(CC1101_PKTCTRL0, 0x00);
   this->write_register(CC1101_ADDR, 0x00);
   this->write_register(CC1101_CHANNR, 0x00);
 
@@ -78,7 +62,7 @@ void CC1101::setup() {
   this->write_register(CC1101_FSCTRL0, 0x00);
 
   ESP_LOGVV(TAG, "setting radio frequency");
-  // Frequency: 868.95 MHz
+  // 868.95 MHz: FREQ = (868950000 * 2^16) / 26000000
   const uint32_t frequency = 868950000;
   uint32_t freq_reg = ((uint64_t)frequency << 16) / F_XTAL;
   this->write_register(CC1101_FREQ2, BYTE(freq_reg, 2));
@@ -143,6 +127,9 @@ void CC1101::setup() {
   ESP_LOGV(TAG, "CC1101 setup done");
 }
 
+// ── SPI primitives ──────────────────────────────────────────────────────────
+// All unchanged from original.
+
 uint8_t CC1101::strobe(uint8_t cmd) {
   this->delegate_->begin_transaction();
   uint8_t status = this->delegate_->transfer(cmd);
@@ -195,8 +182,12 @@ uint8_t CC1101::get_rx_bytes() {
   return this->read_status_register(CC1101_RXBYTES) & 0x7F;
 }
 
+// ── read() / get_frame() ────────────────────────────────────────────────────
+// Unchanged. Used by the base-class read_in_task if our override is ever
+// removed, and kept for API completeness.
+
 optional<uint8_t> CC1101::read() {
-  // GDO0 is active LOW (RXFIFO_THR | 0x40) — UNCHANGED from original
+  // GDO0 active LOW: pin LOW means FIFO ≥ threshold
   if (this->irq_pin_->digital_read() == false) {
     uint8_t rx_bytes = this->get_rx_bytes();
     if (rx_bytes > 0) {
@@ -217,6 +208,9 @@ size_t CC1101::get_frame(uint8_t *buffer, size_t length, uint32_t offset) {
   return 1;
 }
 
+// ── restart_rx() ────────────────────────────────────────────────────────────
+// Unchanged.
+
 void CC1101::restart_rx() {
   ESP_LOGVV(TAG, "Restarting RX");
   this->strobe(CC1101_SIDLE);
@@ -225,6 +219,9 @@ void CC1101::restart_rx() {
   this->strobe(CC1101_SRX);
   delay(1);
 }
+
+// ── get_rssi() ──────────────────────────────────────────────────────────────
+// Unchanged.
 
 int8_t CC1101::get_rssi() {
   int8_t rssi_dec = this->last_rssi_;
@@ -239,12 +236,51 @@ int8_t CC1101::get_rssi() {
 
 const char *CC1101::get_name() { return TAG; }
 
+// ── read_in_task() ──────────────────────────────────────────────────────────
+//
+// This is the ONLY function that changed. Two targeted fixes:
+//
+// FIX 1 — Errata guard condition:
+//   Original: (remaining > 1 && available > 1) → always withholds 1 guard byte
+//   even when the frame has fully arrived in the FIFO (available >= remaining).
+//   This left the final byte permanently unread when available == remaining,
+//   forcing the loop to spin until timeout on every large frame.
+//
+//   Fixed: apply the guard ONLY when available < remaining (the radio is still
+//   actively shifting bytes in, so draining the last FIFO byte risks corruption).
+//   When available >= remaining, all needed bytes are already in the FIFO and
+//   the shift register is idle — drain exactly what we need and exit cleanly.
+//
+// FIX 2 — Unconditional 200µs delay:
+//   Original: delayMicroseconds(200) fires after EVERY loop iteration, including
+//   ones where a large burst was just successfully read. At 100 kbps (1 byte
+//   per 80µs) this delay allows ~2.5 bytes to accumulate before the next
+//   RXBYTES poll. For large frames (encoded size > 64 bytes = FIFO capacity)
+//   the task falls behind the incoming byte rate: the per-iteration SPI overhead
+//   (RXBYTES read + burst read + MARCSTATE read) already consumes significant
+//   time, and adding 200µs on top causes the FIFO to overflow.
+//
+//   Fixed: after a successful burst read, `continue` immediately to re-poll
+//   RXBYTES without any delay. The delay is only applied when the FIFO is
+//   empty (no bytes available yet), preventing a tight busy-wait spin while
+//   still yielding CPU when there is genuinely nothing to read.
+//
+// FIX 3 — Removed unnecessary MARCSTATE read:
+//   The MARCSTATE check (IDLE or RX_END detection) added one extra 2-byte SPI
+//   transaction per loop iteration. In fixed-255 mode the radio never reaches
+//   IDLE for frames < 255 bytes, so the check never triggered. Removing it
+//   reduces per-iteration overhead and makes the drain loop faster, directly
+//   reducing overflow risk on large frames.
+//   (CC1101_MARCSTATE_RX_END = 0x0E is a real CC1101 state, but it only occurs
+//   in fixed-length mode after the full PKTLEN bytes are received — never for
+//   our sub-255-byte wM-Bus frames.)
+
 bool CC1101::read_in_task(uint8_t *buffer, size_t length, uint32_t offset) {
   size_t total = 0;
   uint32_t last_progress = millis();
 
   while (total < length) {
-    // Check for FIFO overflow (bit 7 of RXBYTES)
+    // Check for FIFO overflow (bit 7 set in RXBYTES)
     uint8_t rxbytes_raw = this->read_status_register(CC1101_RXBYTES);
     if (rxbytes_raw & 0x80) {
       ESP_LOGW(TAG, "RX FIFO overflow");
@@ -257,25 +293,16 @@ bool CC1101::read_in_task(uint8_t *buffer, size_t length, uint32_t offset) {
 
     if (available > 0) {
       size_t to_read;
-      if (available < remaining) {
-        // *** FIX 2: CC1101 errata guard ***
-        //
-        // The radio is still actively receiving (more bytes expected than are currently
-        // in the FIFO). Do not drain the last byte: if the shift register is pushing a
-        // new byte in simultaneously, reading the last FIFO byte can corrupt it.
-        //
-        // Original condition was (remaining > 1 && available > 1), which withheld the
-        // guard byte even after the frame had fully arrived in the FIFO (when
-        // available >= remaining), stalling the loop forever on the last byte of any
-        // long frame.
-        //
-        // New condition: leave 1 guard byte only when available < remaining (the frame
-        // is genuinely still in flight). Once available >= remaining, we have all the
-        // bytes we need and can drain them all safely.
-        to_read = (available > 1) ? (size_t)(available - 1) : 0;
-      } else {
-        // All remaining bytes are already in the FIFO — drain exactly what we need.
+
+      if (available >= remaining) {
+        // All the bytes we still need are already in the FIFO.
+        // The shift register is idle — safe to drain everything.
         to_read = remaining;
+      } else {
+        // Frame still arriving: the shift register may be pushing a new byte
+        // into the FIFO right now. Per CC1101 errata, do not read the FIFO
+        // completely to zero in this situation — leave 1 byte as a guard.
+        to_read = (available > 1) ? (size_t)(available - 1) : 0;
       }
 
       if (to_read > 0) {
@@ -285,24 +312,22 @@ bool CC1101::read_in_task(uint8_t *buffer, size_t length, uint32_t offset) {
         this->read_burst(CC1101_RXFIFO, buffer + total, to_read);
         total += to_read;
         last_progress = millis();
-      }
 
-      // *** FIX 3: Removed MARCSTATE end-of-packet drain ***
-      //
-      // In infinite packet mode (PKTCTRL0 = 0x02) the CC1101 never transitions to
-      // IDLE by itself, so the MARCSTATE_IDLE check could never fire. The loop exits
-      // naturally when total == length. CC1101_MARCSTATE_RX_END was also not a valid
-      // datasheet state value.
+        // Re-poll RXBYTES immediately — do NOT delay after a successful read.
+        // At 100 kbps a byte arrives every 80µs; adding 200µs here causes the
+        // task to fall behind on large frames and overflow the 64-byte FIFO.
+        continue;
+      }
     }
 
+    // FIFO was empty (or only the guard byte remained). Check for timeout then
+    // yield briefly so we don't busy-spin while waiting for the next byte.
     if (millis() - last_progress > 500) {
       ESP_LOGW(TAG, "RX timeout after %zu bytes (need %zu)", total + offset, length + offset);
       return false;
     }
 
-    if (total < length) {
-      delayMicroseconds(200);
-    }
+    delayMicroseconds(200);
   }
 
   return true;
